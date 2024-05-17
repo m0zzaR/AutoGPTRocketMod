@@ -2,6 +2,9 @@ import json
 import pprint
 from forge.actions import ActionRegister
 from .sdk import PromptEngine
+from .memory import Memory
+from .planner import Planner
+from .executor import Executor
 from forge.sdk import (
     Agent,
     AgentDB,
@@ -12,7 +15,7 @@ from forge.sdk import (
     TaskRequestBody,
     Workspace,
 )
-from forge.utils import chat_completion_request  # Assuming this is a utility function for making the LLM request
+from forge.utils import chat_completion_request
 
 LOG = ForgeLogger(__name__)
 
@@ -21,6 +24,9 @@ class ForgeAgent(Agent):
         super().__init__(database, workspace)
         self.prompt_engine = PromptEngine("gpt-3.5-turbo")
         self.abilities = ActionRegister(self)
+        self.memory = Memory()
+        self.planner = Planner()
+        self.executor = Executor()
 
     async def create_task(self, task_request: TaskRequestBody) -> Task:
         task = await super().create_task(task_request)
@@ -65,6 +71,12 @@ class ForgeAgent(Agent):
                 raise e
 
             LOG.info(f"Answer: {pprint.pformat(answer)}")
+
+            # Store memory and execute planned actions
+            self.memory.store_short_term(answer)
+            actions = self.planner.plan(task)
+            for action in actions:
+                self.executor.execute(action)
 
             # Add a new step to the database
             step = await self.db.create_step(task_id=task_id, input=step_request, is_last=True)
