@@ -1,61 +1,90 @@
-from pathlib import Path
-
-from litellm import AuthenticationError, InvalidRequestError, ModelResponse, acompletion
-from openai import OpenAI
-from openai.types import CreateEmbeddingResponse
-from openai.types.audio import Transcription
-from tenacity import retry, stop_after_attempt, wait_random_exponential
-
-from .sdk.forge_log import ForgeLogger
+import json
+import pprint
+from forge.actions import ActionRegister
+from .sdk import PromptEngine
+from .memory import Memory
+from .planner import Planner
+from .executor import Executor
+from forge.sdk import (
+    Agent,
+    AgentDB,
+    ForgeLogger,
+    Step,
+    StepRequestBody,
+    Task,
+    TaskRequestBody,
+    Workspace,
+)
+from forge.utils import chat_completion_request
 
 LOG = ForgeLogger(__name__)
 
+class ForgeAgent(Agent):
+    def __init__(self, database: AgentDB, workspace: Workspace):
+        super().__init__(database, workspace)
+        self.prompt_engine = PromptEngine("gpt-3.5-turbo")
+        self.abilities = ActionRegister(self)
+        self.memory = Memory()
+        self.planner = Planner()
+        self.executor = Executor()
 
-@retry(wait=wait_random_exponential(min=1, max=40), stop=stop_after_attempt(3))
-async def chat_completion_request(model, messages, **kwargs) -> ModelResponse:
-    """Generate a response to a list of messages using OpenAI's API"""
-    try:
-        kwargs["model"] = model
-        kwargs["messages"] = messages
+    async def create_task(self, task_request: TaskRequestBody) -> Task:
+        task = await super().create_task(task_request)
+        LOG.info(f"📦 Task created: {task.task_id} input: {task.input[:40]}{'...' if len(task.input) > 40 else ''}")
+        return task
 
-        resp = await acompletion(**kwargs)
-        return resp
-    except AuthenticationError as e:
-        LOG.exception("Authentication Error")
-        raise
-    except InvalidRequestError as e:
-        LOG.exception("Invalid Request Error")
-        raise
-    except Exception as e:
-        LOG.error("Unable to generate ChatCompletion response")
-        LOG.error(f"Exception: {e}")
-        raise
+    async def execute_step(self, task_id: str, step_request: StepRequestBody) -> Step:
+        try:
+            task = await self.db.get_task(task_id)
+            if not task:
+                LOG.error(f"Task {task_id} not found.")
+                return None
 
+            # Load prompts for the task
+            system_prompt = self.prompt_engine.load_prompt("system-format")
+            task_kwargs = {
+                "task": task.input,
+                "abilities": self.abilities.list_abilities_for_prompt(),
+            }
+            task_prompt = self.prompt_engine.load_prompt("task-step", **task_kwargs)
 
-@retry(wait=wait_random_exponential(min=1, max=40), stop=stop_after_attempt(3))
-async def create_embedding_request(
-    messages, model="text-embedding-ada-002"
-) -> CreateEmbeddingResponse:
-    """Generate an embedding for a list of messages using OpenAI's API"""
-    try:
-        return OpenAI().embeddings.create(
-            input=[f"{m['role']}: {m['content']}" for m in messages],
-            model=model,
-        )
-    except Exception as e:
-        LOG.error("Unable to generate ChatCompletion response")
-        LOG.error(f"Exception: {e}")
-        raise
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": task_prompt}
+            ]
 
+            # Define parameters for the LLM completion request
+            chat_completion_kwargs = {
+                "messages": messages,
+                "model": "gpt-3.5-turbo",
+            }
 
-@retry(wait=wait_random_exponential(min=1, max=40), stop=stop_after_attempt(3))
-async def transcribe_audio(audio_file: Path) -> Transcription:
-    """Transcribe an audio file using OpenAI's API"""
-    try:
-        return OpenAI().audio.transcriptions.create(
-            model="whisper-1", file=audio_file.open(mode="rb")
-        )
-    except Exception as e:
-        LOG.error("Unable to generate ChatCompletion response")
-        LOG.error(f"Exception: {e}")
-        raise
+            # Make the LLM completion request and handle the response
+            chat_response = await chat_completion_request(**chat_completion_kwargs)
+            response_content = chat_response.choices[0].message.content
+            LOG.info(f"LLM response: {response_content}")
+
+            try:
+                answer = json.loads(response_content)
+            except json.JSONDecodeError as e:
+                LOG.error(f"Error decoding JSON response: {response_content}")
+                raise e
+
+            LOG.info(f"Answer: {pprint.pformat(answer)}")
+
+            # Store memory and execute planned actions
+            self.memory.store_short_term(answer)
+            actions = self.planner.plan(task)
+            for action in actions:
+                self.executor.execute(action)
+
+            # Add a new step to the database
+            step = await self.db.create_step(task_id=task_id, input=step_request, is_last=True)
+            return step
+
+        except json.JSONDecodeError as e:
+            LOG.error(f"JSON decode error: {e}")
+        except Exception as e:
+            LOG.error(f"Error executing step: {e}")
+
+        return None
